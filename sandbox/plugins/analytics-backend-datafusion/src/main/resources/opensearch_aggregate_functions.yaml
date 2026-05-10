@@ -84,3 +84,30 @@ aggregate_functions:
       - args: [{ value: i32, name: x }]
         nullability: DECLARED_OUTPUT
         return: fp64?
+  # TDigest-based approximate continuous percentile. Lowering target for PPL's
+  # `percentile(field, N)` / `percentile_approx(field, N [, compression])`.
+  # PlannerImpl rewrites the call's argList to `[field, percent_fraction]` and drops the
+  # SYMBOL-typed sqlflag column from the upstream Project; the percent column is rescaled
+  # to fp64 in `[0,1]`. SubstraitPlanRewriter then lifts the percent column-ref to an
+  # inline Literal so DataFusion's `approx_percentile_cont` (which requires a literal
+  # percent) is satisfied — `WrappedAggregateCall.getOperands` in isthmus 0.89.1 silently
+  # drops `rexList`, so we can't pass the literal that way.
+  # Only one impl per type combination — substrait keys impls by `(name, args_signature)`
+  # without nullability, so declaring fp64 and fp64? variants for the same arg position
+  # collides and trips "Duplicate key". `nullability: DECLARED_OUTPUT` is what unifies the
+  # nullability handling — actual nullable inputs are promoted to match the spec at lookup.
+  - name: "approx_percentile_cont"
+    description: "TDigest-based approximate continuous percentile."
+    impls:
+      - args: [{ value: fp64, name: x }, { value: fp64, name: percentile }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: fp32, name: x }, { value: fp64, name: percentile }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: i64, name: x }, { value: fp64, name: percentile }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: i32, name: x }, { value: fp64, name: percentile }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?

@@ -470,6 +470,11 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
      */
     private static String substraitNameForCustomAgg(SqlAggFunction op) {
         SqlKind kind = op.getKind();
+        if ((kind == SqlKind.OTHER_FUNCTION || kind == SqlKind.OTHER) && "percentile_approx".equalsIgnoreCase(op.getName())) {
+            // Lowered to DataFusion's approx_percentile_cont. The percent column-ref is
+            // converted to a literal by SubstraitPlanRewriter post-isthmus.
+            return "approx_percentile_cont";
+        }
         return switch (kind) {
             case AVG -> op == SqlStdOperatorTable.AVG ? null : "avg";
             case STDDEV_POP -> "stddev_pop";

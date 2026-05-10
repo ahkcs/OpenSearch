@@ -311,7 +311,8 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
         AggregateFunction.STDDEV_SAMP,
         AggregateFunction.VAR_POP,
         AggregateFunction.VAR_SAMP,
-        AggregateFunction.APPROX_COUNT_DISTINCT
+        AggregateFunction.APPROX_COUNT_DISTINCT,
+        AggregateFunction.PERCENTILE_APPROX
     );
 
     private final DataFusionPlugin plugin;

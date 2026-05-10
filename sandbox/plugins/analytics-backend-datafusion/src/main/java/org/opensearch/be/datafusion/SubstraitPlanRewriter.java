@@ -13,10 +13,18 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
+import io.substrait.expression.AggregateFunctionInvocation;
 import io.substrait.expression.Expression;
+import io.substrait.expression.FieldReference;
+import io.substrait.expression.FunctionArg;
+import io.substrait.expression.ImmutableAggregateFunctionInvocation;
 import io.substrait.expression.ImmutableExpression;
 import io.substrait.plan.Plan;
+import io.substrait.relation.Aggregate;
 import io.substrait.relation.ExpressionCopyOnWriteVisitor;
+import io.substrait.relation.ImmutableAggregate;
+import io.substrait.relation.ImmutableMeasure;
+import io.substrait.relation.Project;
 import io.substrait.relation.Rel;
 import io.substrait.relation.RelCopyOnWriteVisitor;
 import io.substrait.util.EmptyVisitationContext;
@@ -71,6 +79,92 @@ class SubstraitPlanRewriter {
                     .condition(rewritten.orElse(filter.getCondition()))
                     .build()
             );
+        }
+
+        /**
+         * For each {@code approx_percentile_cont} measure, lift the percent column-ref to an
+         * inline {@link Expression.FP64Literal} by tracing it back to the upstream Project's
+         * expression at the referenced column index. DataFusion's
+         * {@code APPROX_PERCENTILE_CONT} planner requires the percent argument to be a
+         * literal — not a column reference — and isthmus 0.89.1's
+         * {@code WrappedAggregateCall.getOperands} drops {@code AggregateCall.rexList}
+         * silently, so we have to thread the literal through argList and inline it here.
+         */
+        @Override
+        public Optional<Rel> visit(Aggregate aggregate, EmptyVisitationContext ctx) {
+            Optional<Rel> newInput = aggregate.getInput().accept(this, ctx);
+            Rel resolvedInput = newInput.orElse(aggregate.getInput());
+            List<Expression> projectExprs = (resolvedInput instanceof Project p) ? p.getExpressions() : null;
+
+            List<Aggregate.Measure> rewrittenMeasures = new ArrayList<>(aggregate.getMeasures().size());
+            boolean measuresChanged = false;
+            for (Aggregate.Measure measure : aggregate.getMeasures()) {
+                AggregateFunctionInvocation func = measure.getFunction();
+                if (projectExprs != null && "approx_percentile_cont".equalsIgnoreCase(func.declaration().name())) {
+                    Optional<AggregateFunctionInvocation> rewritten = liftPercentileLiteral(func, projectExprs);
+                    if (rewritten.isPresent()) {
+                        rewrittenMeasures.add(ImmutableMeasure.builder().from(measure).function(rewritten.get()).build());
+                        measuresChanged = true;
+                        continue;
+                    }
+                }
+                rewrittenMeasures.add(measure);
+            }
+
+            if (newInput.isEmpty() && !measuresChanged) {
+                return Optional.empty();
+            }
+            return Optional.of(ImmutableAggregate.builder().from(aggregate).input(resolvedInput).measures(rewrittenMeasures).build());
+        }
+
+        private Optional<AggregateFunctionInvocation> liftPercentileLiteral(
+            AggregateFunctionInvocation func,
+            List<Expression> projectExprs
+        ) {
+            List<FunctionArg> args = func.arguments();
+            // Expect exactly (field_ref, percent_arg) — see PlannerImpl.rewritePercentileApprox.
+            if (args.size() != 2) return Optional.empty();
+            FunctionArg percentArg = args.get(1);
+            if (!(percentArg instanceof FieldReference fieldRef)) return Optional.empty();
+            Integer fieldIdx = simpleStructFieldIndex(fieldRef);
+            if (fieldIdx == null || fieldIdx < 0 || fieldIdx >= projectExprs.size()) return Optional.empty();
+            Expression projectedExpr = projectExprs.get(fieldIdx);
+            Expression literal = unwrapToLiteral(projectedExpr);
+            if (literal == null) return Optional.empty();
+            List<FunctionArg> newArgs = new ArrayList<>(args);
+            newArgs.set(1, literal);
+            return Optional.of(ImmutableAggregateFunctionInvocation.builder().from(func).arguments(newArgs).build());
+        }
+
+        /**
+         * For a simple root struct-field reference (no nested element/map traversal), returns
+         * the field index. Returns {@code null} for any other shape.
+         */
+        private static Integer simpleStructFieldIndex(FieldReference ref) {
+            if (!ref.isSimpleRootReference() || ref.segments().size() != 1) return null;
+            FieldReference.ReferenceSegment seg = ref.segments().get(0);
+            if (seg instanceof FieldReference.StructField sf) {
+                return sf.offset();
+            }
+            return null;
+        }
+
+        /**
+         * Walks {@code expr} through {@link Expression.Cast} wrappers — Calcite often emits a
+         * type-pinning {@code CAST(0.5E0:DOUBLE):DOUBLE} after constant-folding the rescale —
+         * and returns the inner {@link Expression.Literal} (untouched) if there is one. The
+         * literal value carries the percent fraction; the wrapping CAST is redundant for
+         * DataFusion's percentile-arg consumer, which just needs a scalar literal.
+         */
+        private static Expression unwrapToLiteral(Expression expr) {
+            Expression cur = expr;
+            while (cur instanceof Expression.Cast cast) {
+                cur = cast.input();
+            }
+            if (cur instanceof Expression.Literal) {
+                return cur;
+            }
+            return null;
         }
     }
 

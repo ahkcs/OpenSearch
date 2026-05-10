@@ -54,7 +54,14 @@ public enum AggregateFunction {
     // Approximate — probabilistic, fixed-size state. Engine-native merge: null reducer
     // means the field is reduced by this same function (APPROX_COUNT_DISTINCT merges
     // partial HLL sketches into a final sketch).
-    APPROX_COUNT_DISTINCT(Type.APPROXIMATE, SqlKind.OTHER, fields(IF("sketch", new ArrowType.Binary(), null)));
+    APPROX_COUNT_DISTINCT(Type.APPROXIMATE, SqlKind.OTHER, fields(IF("sketch", new ArrowType.Binary(), null))),
+    /**
+     * PPL's {@code percentile_approx(field, percentile [, compression])} UDAF — TDigest-based
+     * approximate percentile. Resolved by name (Calcite SqlKind is OTHER_FUNCTION); the lowercase
+     * wire name comes from {@code PPLBuiltinOperators.PERCENTILE_APPROX}, and
+     * {@code fromNameOrError} is case-insensitive.
+     */
+    PERCENTILE_APPROX(Type.APPROXIMATE, SqlKind.OTHER);
 
     /** Category of aggregate function. Affects execution strategy (shuffle vs map-reduce). */
     public enum Type {

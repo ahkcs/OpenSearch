@@ -19,11 +19,22 @@ import org.apache.calcite.plan.hep.HepProgramBuilder;
 import org.apache.calcite.plan.volcano.AbstractConverter;
 import org.apache.calcite.plan.volcano.VolcanoPlanner;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.core.Aggregate;
+import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.rules.ReduceExpressionsRule;
+import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rel.type.RelDataTypeFactory;
+import org.apache.calcite.rex.RexBuilder;
+import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.SqlAggFunction;
+import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.tools.RelBuilder;
+import org.apache.calcite.util.ImmutableBitSet;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.planner.rel.OpenSearchDistributionTraitDef;
@@ -36,7 +47,10 @@ import org.opensearch.analytics.planner.rules.OpenSearchSortRule;
 import org.opensearch.analytics.planner.rules.OpenSearchTableScanRule;
 import org.opensearch.analytics.planner.rules.OpenSearchUnionRule;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Central planner for the Analytics Plugin.
@@ -83,6 +97,20 @@ public class PlannerImpl {
      */
     public static RelNode markAndOptimize(RelNode rawRelNode, PlannerContext context) {
         LOGGER.info("Input RelNode:\n{}", RelOptUtil.toString(rawRelNode));
+
+        // Rewrite PPL's `percentile_approx(field, percent, sqlflag[, compression])` aggregate
+        // calls into a 2-arg shape `(field, percent_fraction)`. PPL injects the sqlflag as an
+        // internal type-tag for its TDigest UDAF; a backend that maps the call to its own
+        // native approximate-percentile implementation has no use for it. SYMBOL also isn't a
+        // known FieldType, so leaving it in trips OpenSearchAggregateRule's storage-info
+        // resolve. We keep BOTH the field and the percent column in argList so isthmus 0.89.1
+        // emits both args; SubstraitPlanRewriter then lifts the percent column-ref to a Literal
+        // post-isthmus (DataFusion requires the percent as a literal). Run at the top of
+        // markAndOptimize so the SYMBOL column is gone before any rule (incl.
+        // OpenSearchAggregateReduceRule) sees the plan.
+        // TODO: move to a per-backend RelNode preprocess hook on AnalyticsSearchBackendPlugin
+        // once that SPI exists.
+        rawRelNode = rewritePercentileApprox(rawRelNode);
 
         // Phase 1a: Pre-marking logical optimizations (constant expression reduction)
         HepProgramBuilder preBuilder = new HepProgramBuilder();
@@ -158,5 +186,165 @@ public class PlannerImpl {
 
         LOGGER.info("After CBO:\n{}", RelOptUtil.toString(result));
         return result;
+    }
+
+    /**
+     * Walks the tree and rewrites Aggregate+Project pairs that include a
+     * {@code percentile_approx(field, percent, sqlflag[, compression])} call.
+     *
+     * <p>Drops the SYMBOL-typed sqlflag column (and any compression hint column) from the
+     * feeding Project, rescales the percent column from {@code [0,100]} to {@code [0,1]},
+     * and updates the Aggregate's argList to {@code [field, percent]} skipping the dropped
+     * indices. Aggregates without any percentile_approx call, or whose input isn't a Project,
+     * are left unchanged.
+     */
+    private static RelNode rewritePercentileApprox(RelNode node) {
+        boolean changed = false;
+        List<RelNode> newInputs = new ArrayList<>(node.getInputs().size());
+        for (RelNode input : node.getInputs()) {
+            RelNode rewritten = rewritePercentileApprox(input);
+            newInputs.add(rewritten);
+            if (rewritten != input) {
+                changed = true;
+            }
+        }
+        RelNode current = changed ? node.copy(node.getTraitSet(), newInputs) : node;
+
+        if (!(current instanceof Aggregate agg)) {
+            return current;
+        }
+        boolean hasPercentile = agg.getAggCallList().stream().anyMatch(PlannerImpl::isPercentileApproxCall);
+        if (!hasPercentile) {
+            return current;
+        }
+        if (!(agg.getInput() instanceof Project project)) {
+            return current;
+        }
+        int projectFieldCount = project.getProjects().size();
+        List<RexNode> projectExprs = project.getProjects();
+
+        // Identify columns referenced as the trailing extra args (position 2+) of any
+        // percentile_approx call — those are the sqlflag + optional compression hint and
+        // are candidates to drop. Track which Project indices are referenced by NON-percentile
+        // users so we don't accidentally drop them. Position-1 (percent) columns are kept and
+        // rescaled in-place.
+        boolean[] usedByOther = new boolean[projectFieldCount];
+        boolean[] usedAsPercentColumn = new boolean[projectFieldCount];
+        for (AggregateCall call : agg.getAggCallList()) {
+            List<Integer> args = call.getArgList();
+            if (isPercentileApproxCall(call)) {
+                if (!args.isEmpty() && args.get(0) >= 0 && args.get(0) < projectFieldCount) {
+                    usedByOther[args.get(0)] = true; // field column — kept
+                }
+                if (args.size() >= 2 && args.get(1) >= 0 && args.get(1) < projectFieldCount) {
+                    usedAsPercentColumn[args.get(1)] = true;
+                }
+            } else {
+                for (int idx : args) {
+                    if (idx >= 0 && idx < projectFieldCount) {
+                        usedByOther[idx] = true;
+                    }
+                }
+            }
+        }
+        for (int idx : agg.getGroupSet()) {
+            if (idx >= 0 && idx < projectFieldCount) {
+                usedByOther[idx] = true;
+            }
+        }
+        boolean[] drop = new boolean[projectFieldCount];
+        for (AggregateCall call : agg.getAggCallList()) {
+            if (!isPercentileApproxCall(call)) continue;
+            List<Integer> args = call.getArgList();
+            for (int i = 2; i < args.size(); i++) {
+                int idx = args.get(i);
+                if (idx >= 0 && idx < projectFieldCount && !usedByOther[idx]) {
+                    drop[idx] = true;
+                }
+            }
+        }
+        // Build the new Project. Percent columns are rescaled in place to fp64 / 100.0;
+        // dropped indices are skipped; everything else passes through.
+        RexBuilder rexBuilder = project.getCluster().getRexBuilder();
+        RelDataTypeFactory typeFactory = rexBuilder.getTypeFactory();
+        RelDataType fp64NotNull = typeFactory.createSqlType(SqlTypeName.DOUBLE);
+        List<RexNode> newExprs = new ArrayList<>();
+        List<String> newNames = new ArrayList<>();
+        Map<Integer, Integer> remap = new HashMap<>();
+        List<String> oldNames = project.getRowType().getFieldNames();
+        for (int i = 0; i < projectFieldCount; i++) {
+            if (drop[i]) continue;
+            RexNode expr = projectExprs.get(i);
+            if (usedAsPercentColumn[i] && !usedByOther[i]) {
+                // Rescale percent: CAST(percent AS DOUBLE) / 100.0 — produces a literal fp64
+                // value at planning time after constant fold.
+                RexNode asDouble = rexBuilder.makeCast(fp64NotNull, expr, false);
+                expr = rexBuilder.makeCall(
+                    SqlStdOperatorTable.DIVIDE,
+                    asDouble,
+                    rexBuilder.makeApproxLiteral(java.math.BigDecimal.valueOf(100.0))
+                );
+            }
+            remap.put(i, newExprs.size());
+            newExprs.add(expr);
+            newNames.add(oldNames.get(i));
+        }
+        RelNode newProject = RelBuilder.proto(Contexts.empty())
+            .create(project.getCluster(), null)
+            .push(project.getInput())
+            .project(newExprs, newNames, true)
+            .build();
+
+        // Rebuild Aggregate calls — for percentile calls, narrow argList to [field, percent]
+        // and remap indices. Other calls just remap their argList. Keep the original return
+        // type since field is operand 0, ARG0_FORCE_NULLABLE still picks the field type.
+        ImmutableBitSet newGroupSet = remapBitSet(agg.getGroupSet(), remap);
+        List<ImmutableBitSet> newGroupSets = agg.getGroupSets().stream().map(s -> remapBitSet(s, remap)).toList();
+        List<AggregateCall> newCalls = new ArrayList<>(agg.getAggCallList().size());
+        for (AggregateCall call : agg.getAggCallList()) {
+            List<Integer> oldArgs = call.getArgList();
+            int retainCount = isPercentileApproxCall(call) ? Math.min(2, oldArgs.size()) : oldArgs.size();
+            List<Integer> newArgs = new ArrayList<>(retainCount);
+            for (int i = 0; i < retainCount; i++) {
+                Integer remapped = remap.get(oldArgs.get(i));
+                if (remapped != null) {
+                    newArgs.add(remapped);
+                }
+            }
+            ImmutableBitSet newDistinctKeys = call.distinctKeys != null ? remapBitSet(call.distinctKeys, remap) : null;
+            newCalls.add(
+                AggregateCall.create(
+                    call.getAggregation(),
+                    call.isDistinct(),
+                    call.isApproximate(),
+                    call.ignoreNulls(),
+                    call.rexList,
+                    newArgs,
+                    call.filterArg >= 0 ? remap.getOrDefault(call.filterArg, -1) : call.filterArg,
+                    newDistinctKeys,
+                    call.collation,
+                    call.getType(),
+                    call.getName()
+                )
+            );
+        }
+        return agg.copy(agg.getTraitSet(), newProject, newGroupSet, newGroupSets, newCalls);
+    }
+
+    private static boolean isPercentileApproxCall(AggregateCall call) {
+        SqlAggFunction op = call.getAggregation();
+        return (op.getKind() == SqlKind.OTHER_FUNCTION || op.getKind() == SqlKind.OTHER)
+            && "percentile_approx".equalsIgnoreCase(op.getName());
+    }
+
+    private static ImmutableBitSet remapBitSet(ImmutableBitSet bits, Map<Integer, Integer> remap) {
+        ImmutableBitSet.Builder b = ImmutableBitSet.builder();
+        for (int idx : bits) {
+            Integer m = remap.get(idx);
+            if (m != null) {
+                b.set(m);
+            }
+        }
+        return b.build();
     }
 }
