@@ -14,6 +14,7 @@ import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Aggregate functions that a backend may support, categorized by {@link Type}.
@@ -111,10 +112,15 @@ public enum AggregateFunction {
         return null;
     }
 
-    /** Maps an aggregate function name to an AggregateFunction. Throws if not recognized. */
+    /**
+     * Maps an aggregate function name to an AggregateFunction. Throws if not recognized.
+     * Lookup is case-insensitive — Calcite-internal SqlAggFunction names use whatever case
+     * they were registered with (PPL UDAFs typically lowercase, e.g. {@code percentile_approx}),
+     * while the enum constants follow uppercase Java convention.
+     */
     public static AggregateFunction fromNameOrError(String name) {
         try {
-            return valueOf(name);
+            return valueOf(name.toUpperCase(Locale.ROOT));
         } catch (IllegalArgumentException e) {
             throw new IllegalStateException("Unrecognized aggregate function [" + name + "]", e);
         }
