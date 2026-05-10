@@ -126,6 +126,7 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
         FunctionMappings.s(SqlLibraryOperators.CONCAT_WS, "concat_ws"),
         FunctionMappings.s(SqlLibraryOperators.ILIKE, "ilike"),
         FunctionMappings.s(SqlLibraryOperators.DATE_PART, "date_part"),
+        FunctionMappings.s(SqlLibraryOperators.DATE_TRUNC, "date_trunc"),
         FunctionMappings.s(ConvertTzAdapter.LOCAL_CONVERT_TZ_OP, "convert_tz"),
         FunctionMappings.s(UnixTimestampAdapter.LOCAL_TO_UNIXTIME_OP, "to_unixtime"),
         // Niladic ops from DateTimeAdapters — each maps 1:1 to a DF builtin.
@@ -458,16 +459,25 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
 
     /**
      * Returns the Substrait function name an aggregator should bind to, or {@code null} if no
-     * mapping should be added. Stock {@link SqlStdOperatorTable} references already have valid
-     * Sigs in {@code FunctionMappings.AGGREGATE_SIGS} (for AVG) or aren't expressible without
-     * a custom adapter (STDDEV/VAR — substrait core requires the {@code distribution} option
-     * arg). For now we only bind AVG variants whose name is {@code "AVG"}.
+     * mapping should be added. The default isthmus {@code AGGREGATE_SIGS} only contains stock
+     * SqlStdOperatorTable references; PPL's NullableSqlAvgAggFunction (used for AVG / STDDEV /
+     * VAR with FORCE_NULLABLE return type) doesn't bind via reference equality, so we generate
+     * Sigs for the in-tree custom instances. STDDEV/VAR map to direct names declared in
+     * {@code opensearch_aggregate_functions.yaml}; substrait core only has the singular
+     * {@code std_dev} / {@code variance} with a {@code distribution} option, but DataFusion's
+     * substrait consumer recognizes the per-distribution names directly so we declare them as
+     * separate functions to avoid the option-arg ceremony.
      */
     private static String substraitNameForCustomAgg(SqlAggFunction op) {
-        if (op.getKind() == SqlKind.AVG && op != SqlStdOperatorTable.AVG) {
-            return "avg";
-        }
-        return null;
+        SqlKind kind = op.getKind();
+        return switch (kind) {
+            case AVG -> op == SqlStdOperatorTable.AVG ? null : "avg";
+            case STDDEV_POP -> "stddev_pop";
+            case STDDEV_SAMP -> "stddev_samp";
+            case VAR_POP -> "var_pop";
+            case VAR_SAMP -> "var_samp";
+            default -> null;
+        };
     }
 
     private static RelNode rewriteStageInputScans(RelNode node) {

@@ -74,7 +74,18 @@ public class FragmentConversionDriver {
      * {@link StagePlan#convertedBytes()} on each plan.
      */
     public static void convertAll(QueryDAG dag, CapabilityRegistry registry) {
-        convertStage(dag.rootStage(), registry);
+        try {
+            convertStage(dag.rootStage(), registry);
+        } catch (AssertionError e) {
+            // Calcite's Litmus.THROW (Project.isValid via RexUtil.compatibleTypes,
+            // Aggregate.typeMatchesInferred, etc.) throws AssertionError directly via Java
+            // code rather than via the `assert` keyword, so JVM -da doesn't gate them. If
+            // one fires inside a search thread, OpenSearchUncaughtExceptionHandler exits the
+            // cluster JVM. Convert to IllegalStateException so the analytics-engine error
+            // path treats it as a normal per-query failure (HTTP 500 with a bucketable
+            // message) instead of taking down the cluster.
+            throw new IllegalStateException("Fragment conversion rejected the plan: " + e.getMessage(), e);
+        }
         // Root stage executes locally at coordinator — store factory for instruction dispatch.
         Stage root = dag.rootStage();
         if (root.getExchangeSinkProvider() != null && !root.getPlanAlternatives().isEmpty()) {

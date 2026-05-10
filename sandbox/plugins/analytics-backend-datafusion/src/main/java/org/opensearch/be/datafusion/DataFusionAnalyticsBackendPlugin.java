@@ -269,7 +269,11 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
         // PPL `mvfind` returns INTEGER (the 0-based index of the first match, or NULL); backed
         // by a custom Rust UDF on the DataFusion session context (`udf::mvfind`), routed via
         // {@link MvfindAdapter}.
-        ScalarFunction.MVFIND
+        ScalarFunction.MVFIND,
+        // PPL `span(field, interval, unit?)` — bucketing for `stats … by span(...)`. Numeric
+        // span lowers to {@code floor(field/interval)*interval}; time span (interval=1) to
+        // {@code date_trunc(unit, field)}. Both targets are substrait-default operators.
+        ScalarFunction.SPAN
     );
 
     /**
@@ -460,6 +464,7 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
                     Map.entry(ScalarFunction.SECOND_OF_MINUTE, second),
                     Map.entry(ScalarFunction.SIGN, nameMapping(SignumFunction.FUNCTION)),
                     Map.entry(ScalarFunction.SINH, new HyperbolicOperatorAdapter(SqlLibraryOperators.SINH)),
+                    Map.entry(ScalarFunction.SPAN, new SpanAdapter()),
                     Map.entry(ScalarFunction.STRCMP, new StrcmpFunctionAdapter()),
                     Map.entry(ScalarFunction.STRFTIME, new StrftimeFunctionAdapter()),
                     Map.entry(ScalarFunction.STR_TO_DATE, new RustUdfDateTimeAdapters.StrToDateAdapter()),

@@ -11,3 +11,76 @@ aggregate_functions:
           - value: any
             name: "input"
         return: i64
+  # Distribution-specific stddev / variance variants.
+  #
+  # Substrait core declares only `std_dev` and `variance` (singular) with a
+  # `distribution` option arg. DataFusion's substrait consumer recognizes the
+  # split per-distribution names directly, and PPL emits separate Calcite
+  # SqlAggFunctions for STDDEV_POP / STDDEV_SAMP / VAR_POP / VAR_SAMP — so it's
+  # simpler to declare the four split names here and let isthmus pass them
+  # through verbatim than to teach our converter how to fold the distribution
+  # into a substrait-conformant `std_dev` / `variance` call.
+  #
+  # Argument list mirrors substrait core's `std_dev`: a single numeric input.
+  # Return type pinned to fp64 (same as DataFusion's runtime promotion of
+  # integer inputs to fp64 for variance / stddev).
+  - name: "stddev_pop"
+    description: "Population standard deviation."
+    impls:
+      - args: [{ value: fp64, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: fp32, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: i64, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: i32, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+  - name: "stddev_samp"
+    description: "Sample standard deviation."
+    impls:
+      - args: [{ value: fp64, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: fp32, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: i64, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: i32, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+  - name: "var_pop"
+    description: "Population variance."
+    impls:
+      - args: [{ value: fp64, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: fp32, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: i64, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: i32, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+  - name: "var_samp"
+    description: "Sample variance."
+    impls:
+      - args: [{ value: fp64, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: fp32, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: i64, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
+      - args: [{ value: i32, name: x }]
+        nullability: DECLARED_OUTPUT
+        return: fp64?
