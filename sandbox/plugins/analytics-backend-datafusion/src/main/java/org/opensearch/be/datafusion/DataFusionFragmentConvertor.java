@@ -20,11 +20,13 @@ import org.apache.calcite.rel.RelDistributions;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelReferentialConstraint;
 import org.apache.calcite.rel.RelRoot;
+import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.schema.ColumnStrategy;
+import org.apache.calcite.sql.SqlAggFunction;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.fun.SqlLibraryOperators;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
@@ -421,6 +423,53 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
      * multi-input shapes (Union) each branch refers to its own child stage id and the
      * isthmus visitor emits one {@link NamedScan} per branch.
      */
+    /**
+     * Collects the SqlAggFunction instances used in any {@link AggregateCall} below {@code node}
+     * whose kind matches a substrait-mappable aggregator AND whose reference is NOT the stock
+     * {@link SqlStdOperatorTable} instance — typically PPL's {@code NullableSqlAvgAggFunction}.
+     * Isthmus' {@link AggregateFunctionConverter} resolves bindings by SqlOperator reference,
+     * so we generate per-instance Sigs to make the custom operators bind to the substrait
+     * {@code avg} (etc.) function spec.
+     */
+    private static List<FunctionMappings.Sig> collectCustomAggregateSigs(RelNode node) {
+        java.util.LinkedHashMap<SqlAggFunction, String> collected = new java.util.LinkedHashMap<>();
+        collectCustomAggregateSigsInto(node, collected);
+        List<FunctionMappings.Sig> sigs = new ArrayList<>(collected.size());
+        for (var e : collected.entrySet()) {
+            sigs.add(FunctionMappings.s(e.getKey(), e.getValue()));
+        }
+        return sigs;
+    }
+
+    private static void collectCustomAggregateSigsInto(RelNode node, java.util.Map<SqlAggFunction, String> collected) {
+        if (node instanceof org.apache.calcite.rel.core.Aggregate agg) {
+            for (AggregateCall call : agg.getAggCallList()) {
+                SqlAggFunction op = call.getAggregation();
+                String substraitName = substraitNameForCustomAgg(op);
+                if (substraitName != null) {
+                    collected.putIfAbsent(op, substraitName);
+                }
+            }
+        }
+        for (RelNode input : node.getInputs()) {
+            collectCustomAggregateSigsInto(input, collected);
+        }
+    }
+
+    /**
+     * Returns the Substrait function name an aggregator should bind to, or {@code null} if no
+     * mapping should be added. Stock {@link SqlStdOperatorTable} references already have valid
+     * Sigs in {@code FunctionMappings.AGGREGATE_SIGS} (for AVG) or aren't expressible without
+     * a custom adapter (STDDEV/VAR — substrait core requires the {@code distribution} option
+     * arg). For now we only bind AVG variants whose name is {@code "AVG"}.
+     */
+    private static String substraitNameForCustomAgg(SqlAggFunction op) {
+        if (op.getKind() == SqlKind.AVG && op != SqlStdOperatorTable.AVG) {
+            return "avg";
+        }
+        return null;
+    }
+
     private static RelNode rewriteStageInputScans(RelNode node) {
         if (node instanceof OpenSearchStageInputScan scan) {
             return new StageInputTableScan(scan.getCluster(), scan.getTraitSet(), "input-" + scan.getChildStageId(), scan.getRowType());
@@ -451,9 +500,17 @@ public class DataFusionFragmentConvertor implements FragmentConvertor {
             typeFactory,
             typeConverter
         );
+        // Combine the static ADDITIONAL_AGGREGATE_SIGS (e.g. APPROX_COUNT_DISTINCT → approx_distinct)
+        // with the dynamically-collected per-tree sigs (PPL's NullableSqlAvgAggFunction-family
+        // operators that bind by SqlOperator reference). Without the dynamic sigs, custom AVG /
+        // STDDEV / VAR / percentile_approx call sites trip "Unable to find binding".
+        List<FunctionMappings.Sig> dynamicAggSigs = collectCustomAggregateSigs(relNode);
+        List<FunctionMappings.Sig> allAggSigs = new ArrayList<>(ADDITIONAL_AGGREGATE_SIGS.size() + dynamicAggSigs.size());
+        allAggSigs.addAll(ADDITIONAL_AGGREGATE_SIGS);
+        allAggSigs.addAll(dynamicAggSigs);
         AggregateFunctionConverter aggConverter = new OpenSearchAggregateFunctionConverter(
             extensions.aggregateFunctions(),
-            ADDITIONAL_AGGREGATE_SIGS,
+            allAggSigs,
             typeFactory,
             typeConverter
         );

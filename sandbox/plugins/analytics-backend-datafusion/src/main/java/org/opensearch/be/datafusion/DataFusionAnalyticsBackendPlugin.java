@@ -303,6 +303,10 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
         AggregateFunction.MAX,
         AggregateFunction.COUNT,
         AggregateFunction.AVG,
+        AggregateFunction.STDDEV_POP,
+        AggregateFunction.STDDEV_SAMP,
+        AggregateFunction.VAR_POP,
+        AggregateFunction.VAR_SAMP,
         AggregateFunction.APPROX_COUNT_DISTINCT
     );
 

@@ -63,7 +63,18 @@ public class PlannerImpl {
     private static final Logger LOGGER = LogManager.getLogger(PlannerImpl.class);
 
     public static RelNode createPlan(RelNode rawRelNode, PlannerContext context) {
-        return markAndOptimize(rawRelNode, context);
+        try {
+            return markAndOptimize(rawRelNode, context);
+        } catch (AssertionError e) {
+            // Calcite's Litmus.THROW (used by RelOptUtil.eq, Aggregate.typeMatchesInferred,
+            // various validators) throws AssertionError directly via Java code rather than via
+            // the `assert` keyword, so JVM -da doesn't gate them. If one fires inside a search
+            // thread, OpenSearchUncaughtExceptionHandler exits the cluster JVM. Convert to
+            // IllegalStateException so the analytics-engine error path treats it as a normal
+            // per-query failure (HTTP 500 with a bucketable message) instead of taking down
+            // the cluster.
+            throw new IllegalStateException("Analytics-engine planner rejected the plan: " + e.getMessage(), e);
+        }
     }
 
     /**
