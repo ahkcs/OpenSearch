@@ -12,6 +12,7 @@ import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.core.AggregateCall;
 import org.opensearch.analytics.planner.PlannerContext;
 import org.opensearch.analytics.planner.rel.AggregateMode;
 import org.opensearch.analytics.planner.rel.OpenSearchAggregate;
@@ -55,7 +56,30 @@ public class OpenSearchAggregateSplitRule extends RelOptRule {
     @Override
     public boolean matches(RelOptRuleCall call) {
         OpenSearchAggregate aggregate = call.rel(0);
-        return aggregate.getMode() == AggregateMode.SINGLE;
+        if (aggregate.getMode() != AggregateMode.SINGLE) {
+            return false;
+        }
+        // percentile_approx is a 2-arg aggregate (field, percent) whose FINAL phase needs
+        // (tdigest_state, percent_literal). AggregateDecompositionResolver's single-field
+        // rewrite paths only produce a single-arg FINAL call, which yields a malformed
+        // OpenSearchAggregate row type and trips Calcite's RelMdRowType equivalence check
+        // ("Type mismatch: rel rowtype: RecordType(BIGINT p50, BIGINT p50_0) NOT NULL,
+        // equiv rowtype: RecordType(INTEGER bucket, BIGINT p50)"). Until the resolver gains
+        // support for engine-native merges that preserve a literal/passthrough operand,
+        // skip the split so percentile runs as a single-stage SINGLE aggregate at the
+        // coordinator. Other aggCalls in the same Aggregate (SUM, AVG, etc.) inherit the
+        // single-stage execution; this is a conservative correctness-over-perf trade-off
+        // for a small class of queries.
+        for (AggregateCall aggCall : aggregate.getAggCallList()) {
+            if (isPercentileApprox(aggCall)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isPercentileApprox(AggregateCall aggCall) {
+        return "PERCENTILE_APPROX".equalsIgnoreCase(aggCall.getAggregation().getName());
     }
 
     @Override
