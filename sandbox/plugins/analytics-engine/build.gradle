@@ -228,3 +228,19 @@ internalClusterTest {
   systemProperty 'io.netty.tryReflectionSetAccessible', 'true'
   jvmArgs += ["--add-opens", "java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"]
 }
+
+// Override the root project's runTask testCluster when analytics-engine is in the
+// installed plugin list. The streaming-transport feature gate has to be on for
+// the analytics-engine + SQL-plugin co-install: the SQL plugin's PPL transport
+// handler would otherwise double-register against analytics-engine's handler
+// and Guice would refuse to bring up the node. Keeping the override here (rather
+// than in the central gradle/run.gradle) avoids enabling the flag for regular
+// runs that don't include analytics-engine.
+rootProject.afterEvaluate {
+  rootProject.testClusters.matching { it.name == 'runTask' }.configureEach {
+    def plugins = rootProject.findProperty('installedPlugins')
+    if (plugins != null && plugins.toString().contains('analytics-engine')) {
+      systemProperty 'opensearch.experimental.feature.transport.stream.enabled', 'true'
+    }
+  }
+}
